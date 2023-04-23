@@ -9,6 +9,7 @@ from mmcv.cnn import Conv2d
 from mmcv.ops import point_sample
 from mmdet.models.dense_heads import AnchorFreeHead
 from mmdet.models.dense_heads import MaskFormerHead as MMDET_MaskFormerHead
+from mmdet.models.layers import Mask2FormerTransformerDecoder
 from mmdet.models.utils import get_uncertain_point_coords_with_randomness
 from mmdet.structures.mask import mask2bbox
 from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig, reduce_mean
@@ -24,10 +25,8 @@ from mmtrack.utils import InstanceList, SampleList
 @MODELS.register_module()
 class Mask2FormerHead(MMDET_MaskFormerHead):
     """Implements the Mask2Former head.
-
     See `Masked-attention Mask Transformer for Universal Image
     Segmentation <https://arxiv.org/pdf/2112.01527>`_ for details.
-
     Args:
         in_channels (list[int]): Number of channels in the input feature map.
         feat_channels (int): Number of channels for features.
@@ -105,10 +104,10 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
         self.num_queries = num_queries
         self.num_frames = num_frames
         self.num_transformer_feat_level = num_transformer_feat_level
-        self.num_heads = transformer_decoder.transformerlayers. \
-            attn_cfgs.num_heads
+        self.num_heads = transformer_decoder.layer_cfg. \
+            self_attn_cfg.num_heads
         self.num_transformer_decoder_layers = transformer_decoder.num_layers
-        assert pixel_decoder.encoder.transformerlayers.attn_cfgs.num_levels \
+        assert pixel_decoder.encoder.layer_cfg.self_attn_cfg.num_levels \
                == num_transformer_feat_level
         pixel_decoder_ = copy.deepcopy(pixel_decoder)
         pixel_decoder_.update(
@@ -116,7 +115,8 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
             feat_channels=feat_channels,
             out_channels=out_channels)
         self.pixel_decoder = MODELS.build(pixel_decoder_)
-        self.transformer_decoder = MODELS.build(transformer_decoder)
+        self.transformer_decoder = Mask2FormerTransformerDecoder(
+            **transformer_decoder)
         self.decoder_embed_dims = self.transformer_decoder.embed_dims
 
         self.decoder_input_projs = ModuleList()
@@ -171,7 +171,6 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
 
     def preprocess_gt(self, batch_gt_instances: InstanceList) -> InstanceList:
         """Preprocess the ground truth for all images.
-
         It aims to reorganize the `gt`. For example, in the
         `batch_data_sample.gt_instances.mask`, its shape is
         `(all_num_gts, h, w)`, but we don't know each gt belongs to which `img`
@@ -179,17 +178,14 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
         to `(num_gts_per_img, num_frames, h, w)`. In addition, we can't
         guarantee that the number of instances in these two images is equal,
         so `-1` refers to nonexistent instances.
-
         Args:
             batch_gt_instances (list[:obj:`InstanceData`]): Batch of
                 gt_instance. It usually includes ``labels``, each is
                 ground truth labels of each bbox, with shape (num_gts, )
                 and ``masks``, each is ground truth masks of each instances
                 of an image, shape (num_gts, h, w).
-
         Returns:
             list[obj:`InstanceData`]: each contains the following keys
-
                 - labels (Tensor): Ground truth class indices\
                     for an image, with shape (n, ), n is the sum of\
                     number of stuff type and number of instance in an image.
@@ -251,7 +247,6 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
                             gt_instances: InstanceData,
                             img_meta: dict) -> Tuple[Tensor]:
         """Compute classification and mask targets for one image.
-
         Args:
             cls_score (Tensor): Mask score logits from a single decoder layer
                 for one image. Shape (num_queries, cls_out_channels).
@@ -260,10 +255,8 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
             gt_instances (:obj:`InstanceData`): It contains ``labels`` and
                 ``masks``.
             img_meta (dict): Image informtation.
-
         Returns:
             tuple[Tensor]: A tuple containing the following for one image.
-
                 - labels (Tensor): Labels of each image. \
                     shape (num_queries, ).
                 - label_weights (Tensor): Label weights of each image. \
@@ -334,7 +327,6 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
                              batch_gt_instances: List[InstanceData],
                              batch_img_metas: List[dict]) -> Tuple[Tensor]:
         """Loss function for outputs from a single decoder layer.
-
         Args:
             cls_scores (Tensor): Mask score logits from a single decoder layer
                 for all images. Shape (batch_size, num_queries,
@@ -345,7 +337,6 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
             batch_gt_instances (list[obj:`InstanceData`]): each contains
                 ``labels`` and ``masks``.
             batch_img_metas (list[dict]): List of image meta information.
-
         Returns:
             tuple[Tensor]: Loss components for outputs from a single \
                 decoder layer.
@@ -427,16 +418,13 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
         attn_mask_target_size: Tuple[int,
                                      int]) -> Tuple[Tensor, Tensor, Tensor]:
         """Forward for head part which is called after every decoder layer.
-
         Args:
-            decoder_out (Tensor): in shape (num_queries, batch_size, c).
+            decoder_out (Tensor): in shape (batch_size, num_queries, c).
             mask_feature (Tensor): in shape (batch_size, t, c, h, w).
             attn_mask_target_size (tuple[int, int]): target attention
                 mask size.
-
         Returns:
             tuple: A tuple contain three elements.
-
                 - cls_pred (Tensor): Classification scores in shape \
                     (batch_size, num_queries, cls_out_channels). \
                     Note `cls_out_channels` should include background.
@@ -446,7 +434,6 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
                     (batch_size * num_heads, num_queries, h, w).
         """
         decoder_out = self.transformer_decoder.post_norm(decoder_out)
-        decoder_out = decoder_out.transpose(0, 1)
         # shape (batch_size, num_queries, c)
         cls_pred = self.cls_embed(decoder_out)
         # shape (batch_size, num_queries, c)
@@ -454,7 +441,6 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
         # shape (batch_size, num_queries, t, h, w)
         mask_pred = torch.einsum('bqc,btchw->bqthw', mask_embed, mask_feature)
         b, q, t, _, _ = mask_pred.shape
-
         attn_mask = F.interpolate(
             mask_pred.flatten(0, 1),
             attn_mask_target_size,
@@ -476,16 +462,13 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
     def forward(self, x: List[Tensor],
                 data_samples: SampleList) -> Tuple[List[Tensor], List[Tensor]]:
         """Forward function.
-
         Args:
             x (list[Tensor]): Multi scale Features from the
                 upstream network, each is a 4D-tensor.
             data_samples (List[:obj:`TrackDataSample`]): The Data
                 Samples. It usually includes information such as `gt_instance`.
-
         Returns:
             tuple[list[Tensor]]: A tuple contains two elements.
-
                 - cls_pred_list (list[Tensor)]: Classification logits \
                     for each decoder layer. Each is a 3D-tensor with shape \
                     (batch_size, num_queries, cls_out_channels). \
@@ -496,6 +479,7 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
         """
         mask_features, multi_scale_memorys = self.pixel_decoder(x)
         bt, c_m, h_m, w_m = mask_features.shape
+
         batch_size = bt // self.num_frames if self.training else 1
         t = bt // batch_size
         mask_features = mask_features.view(batch_size, t, c_m, h_m, w_m)
@@ -524,11 +508,12 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
                 3).permute(1, 3, 0, 2).flatten(0, 1)
             decoder_inputs.append(decoder_input)
             decoder_positional_encodings.append(decoder_positional_encoding)
-        # shape (num_queries, c) -> (num_queries, batch_size, c)
-        query_feat = self.query_feat.weight.unsqueeze(1).repeat(
-            (1, batch_size, 1))
-        query_embed = self.query_embed.weight.unsqueeze(1).repeat(
-            (1, batch_size, 1))
+
+        # shape (num_queries, c) -> (batch_size, num_queries, c)
+        query_feat = self.query_feat.weight.unsqueeze(0).repeat(
+            (batch_size, 1, 1))
+        query_embed = self.query_embed.weight.unsqueeze(0).repeat(
+            (batch_size, 1, 1))
 
         cls_pred_list = []
         mask_pred_list = []
@@ -542,17 +527,16 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
             # if a mask is all True(all background), then set it all False.
             attn_mask[torch.where(
                 attn_mask.sum(-1) == attn_mask.shape[-1])] = False
-
             # cross_attn + self_attn
             layer = self.transformer_decoder.layers[i]
-            attn_masks = [attn_mask, None]
             query_feat = layer(
                 query=query_feat,
-                key=decoder_inputs[level_idx],
-                value=decoder_inputs[level_idx],
+                key=decoder_inputs[level_idx].permute(1, 0, 2),
+                value=decoder_inputs[level_idx].permute(1, 0, 2),
                 query_pos=query_embed,
-                key_pos=decoder_positional_encodings[level_idx],
-                attn_masks=attn_masks,
+                key_pos=decoder_positional_encodings[level_idx].permute(
+                    1, 0, 2),
+                cross_attn_mask=attn_mask,
                 query_key_padding_mask=None,
                 # here we do not apply masking on padded region
                 key_padding_mask=None)
@@ -572,13 +556,11 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
     ) -> Dict[str, Tensor]:
         """Perform forward propagation and loss calculation of the track head
         on the features of the upstream network.
-
         Args:
             x (tuple[Tensor]): Multi-level features from the upstream
                 network, each is a 4D-tensor.
             data_samples (List[:obj:`TrackDataSample`]): The Data
                 Samples. It usually includes information such as `gt_instance`.
-
         Returns:
             dict[str, Tensor]: a dictionary of loss components
         """
@@ -605,7 +587,6 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
                 data_samples: SampleList,
                 rescale: bool = True) -> InstanceList:
         """Test without augmentation.
-
         Args:
             x (tuple[Tensor]): Multi-level features from the
                 upstream network, each is a 4D-tensor.
@@ -614,7 +595,6 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
             rescale (bool, Optional): If False, then returned bboxes and masks
                 will fit the scale of img, otherwise, returned bboxes and masks
                 will fit the scale of original image shape. Defaults to True.
-
         Returns:
             list[obj:`InstanceData`]: each contains the following keys
                 - labels (Tensor): Prediction class indices\
@@ -649,7 +629,6 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
                         batch_img_metas: List[dict],
                         rescale: bool = True) -> InstanceList:
         """Get top-10 predictions.
-
         Args:
             mask_cls_results (Tensor): Mask classification logits,\
                 shape (batch_size, num_queries, cls_out_channels).
@@ -660,7 +639,6 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
             rescale (bool, Optional): If False, then returned bboxes and masks
                 will fit the scale of img, otherwise, returned bboxes and masks
                 will fit the scale of original image shape. Defaults to True.
-
         Returns:
             list[obj:`InstanceData`]: each contains the following keys
                 - labels (Tensor): Prediction class indices\
@@ -673,7 +651,7 @@ class Mask2FormerHead(MMDET_MaskFormerHead):
         if len(mask_cls_results) > 0:
             scores = F.softmax(mask_cls_results, dim=-1)[:, :-1]
             labels = torch.arange(self.num_classes).unsqueeze(0).repeat(
-                self.num_queries, 1).flatten(0, 1).to(scores.device)
+                self.num_queries, 1).flatten(0, 1)
             # keep top-10 predictions
             scores_per_image, topk_indices = scores.flatten(0, 1).topk(
                 10, sorted=False)

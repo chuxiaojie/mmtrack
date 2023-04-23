@@ -9,7 +9,11 @@ from typing import List, Optional, Sequence, Union
 
 import numpy as np
 import torch
-import trackeval
+try:
+    import trackeval
+except ImportError:
+    trackeval = None
+
 from mmengine.dist import (all_gather_object, barrier, broadcast,
                            broadcast_object_list, get_dist_info,
                            is_main_process)
